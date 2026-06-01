@@ -5,4 +5,4 @@ tifffile
 scikit-image
 pandas
 matplotlib
-numpy
+numpy<2.1
