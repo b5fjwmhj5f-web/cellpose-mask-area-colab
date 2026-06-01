@@ -3,10 +3,13 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import tifffile
 import torch
 from cellpose import models
+from skimage.measure import regionprops
 from skimage.transform import resize
 
 from measure_mask_regionprops import _measure, _plot_histogram
@@ -82,6 +85,8 @@ def main() -> int:
         hist_path = figure_dir / f"{path.stem}_area_histogram.png"
         table.to_csv(csv_path, index=False)
         _plot_histogram(table, hist_path, args.bins)
+        label_guide_path = figure_dir / f"{path.stem}_mask_labels.png"
+        _save_label_guide(masks, label_guide_path)
 
         rows.append(
             {
@@ -96,6 +101,7 @@ def main() -> int:
                 "mask_tif": str(mask_path),
                 "area_csv": str(csv_path),
                 "area_histogram": str(hist_path),
+                "label_guide": str(label_guide_path),
             }
         )
         print(f"OK {path.name}: labels={rows[-1]['labels']}", flush=True)
@@ -187,6 +193,60 @@ def _resolve_device(requested: str) -> torch.device:
     if requested == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested, but torch.cuda.is_available() is False.")
     return torch.device(requested)
+
+
+def _save_label_guide(labels, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if labels.ndim == 2:
+        display = labels
+        text_items = [
+            (prop.label, prop.centroid[1], prop.centroid[0])
+            for prop in regionprops(labels)
+        ]
+        title = "Mask labels"
+    elif labels.ndim == 3:
+        display, text_items = _project_labels_with_centroids(labels)
+        title = "Mask labels, max-area Z per object"
+    else:
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    masked = np.ma.masked_where(display == 0, display)
+    ax.imshow(masked, cmap="nipy_spectral", interpolation="nearest")
+    ax.set_title(title)
+    ax.set_axis_off()
+    for label, x_pos, y_pos in text_items:
+        ax.text(
+            x_pos,
+            y_pos,
+            str(label),
+            color="white",
+            fontsize=6,
+            ha="center",
+            va="center",
+            bbox={"boxstyle": "round,pad=0.15", "facecolor": "black", "alpha": 0.65, "edgecolor": "none"},
+        )
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
+def _project_labels_with_centroids(labels):
+    display = np.zeros(labels.shape[-2:], dtype=labels.dtype)
+    text_items = []
+    for label_id in np.unique(labels):
+        if label_id == 0:
+            continue
+        object_mask = labels == label_id
+        area_by_z = object_mask.reshape(object_mask.shape[0], -1).sum(axis=1)
+        z_index = int(np.argmax(area_by_z))
+        plane = object_mask[z_index]
+        display[plane] = label_id
+        coords = np.argwhere(plane)
+        if coords.size:
+            y_pos, x_pos = coords.mean(axis=0)
+            text_items.append((int(label_id), float(x_pos), float(y_pos)))
+    return display, text_items
 
 
 if __name__ == "__main__":
