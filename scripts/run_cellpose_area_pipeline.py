@@ -53,8 +53,11 @@ def main() -> int:
     model = models.CellposeModel(gpu=device.type == "cuda", device=device)
     print(f"Cellpose device: {device}", flush=True)
 
+    input_files = _iter_inputs(input_path, args.pattern)
+    print(f"Input files: {len(input_files)}", flush=True)
+
     rows = []
-    for path in _iter_inputs(input_path, args.pattern):
+    for path in input_files:
         axes, image = _read_tiff(path, args.axes)
         prepared, prepared_axes = _prepare_for_cellpose(image, axes, args.seg_channel)
         prepared = _resize_yx(prepared, args.max_yx)
@@ -105,7 +108,19 @@ def main() -> int:
 def _iter_inputs(input_path: Path, pattern: str):
     if input_path.is_file():
         return [input_path]
-    return sorted(input_path.glob(pattern))
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input does not exist: {input_path}")
+    if not input_path.is_dir():
+        raise ValueError(f"Input is neither a file nor a directory: {input_path}")
+
+    files = sorted(input_path.glob(pattern))
+    if not files:
+        raise FileNotFoundError(
+            f"No files matched pattern {pattern!r} in {input_path}. "
+            "If your file extension is .tiff, use --pattern '*.tiff'. "
+            "If you want one image, pass the full .tif/.tiff file path."
+        )
+    return files
 
 
 def _read_tiff(path: Path, axes_override: str | None):
