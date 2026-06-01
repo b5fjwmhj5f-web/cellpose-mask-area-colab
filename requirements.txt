@@ -1,0 +1,8 @@
+cellpose
+torch
+torchvision
+tifffile
+scikit-image
+pandas
+matplotlib
+numpy
