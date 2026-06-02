@@ -9,6 +9,7 @@ import pandas as pd
 import tifffile
 import torch
 from cellpose import models
+from matplotlib.colors import to_rgb
 from skimage.measure import regionprops
 from skimage.transform import resize
 
@@ -34,14 +35,32 @@ def main() -> int:
         help="0-based channel for segmentation. Example: C3 DAPI is --seg-channel 2.",
     )
     parser.add_argument("--max-yx", type=int, default=0, help="Resize longest Y/X side to this size. 0 keeps original pixels.")
-    parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto")
     parser.add_argument("--do-3d", choices=["auto", "true", "false"], default="auto")
     parser.add_argument("--diameter", type=float, default=None)
+    parser.add_argument("--pretrained-model", default="cpsam")
+    parser.add_argument("--model-type", default=None)
     parser.add_argument("--flow-threshold", type=float, default=0.4)
     parser.add_argument("--cellprob-threshold", type=float, default=0.0)
     parser.add_argument("--min-size", type=int, default=15)
     parser.add_argument("--z-mode", choices=["auto", "all", "per-slice", "max-area-slice", "volume"], default="all")
     parser.add_argument("--bins", type=int, default=30)
+    parser.add_argument("--hist-y-scale", choices=["linear", "log"], default="log")
+    parser.add_argument("--hist-min-area", type=float, default=0.0)
+    parser.add_argument(
+        "--label-color-mode",
+        choices=["label", "area-threshold"],
+        default="label",
+        help="Color mode for figures/*_mask_labels.png.",
+    )
+    parser.add_argument(
+        "--label-area-threshold",
+        type=float,
+        default=None,
+        help="Area threshold for --label-color-mode area-threshold.",
+    )
+    parser.add_argument("--label-color-above", default="red")
+    parser.add_argument("--label-color-below", default="yellow")
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -53,8 +72,15 @@ def main() -> int:
         directory.mkdir(parents=True, exist_ok=True)
 
     device = _resolve_device(args.device)
-    model = models.CellposeModel(gpu=device.type == "cuda", device=device)
+    model = models.CellposeModel(
+        gpu=device.type == "cuda",
+        device=device,
+        pretrained_model=args.pretrained_model,
+        model_type=args.model_type,
+    )
     print(f"Cellpose device: {device}", flush=True)
+    print(f"Cellpose pretrained_model: {args.pretrained_model}", flush=True)
+    print(f"Cellpose model_type: {args.model_type}", flush=True)
 
     input_files = _iter_inputs(input_path, args.pattern)
     print(f"Input files: {len(input_files)}", flush=True)
@@ -84,9 +110,16 @@ def main() -> int:
         csv_path = table_dir / f"{path.stem}_mask_area.csv"
         hist_path = figure_dir / f"{path.stem}_area_histogram.png"
         table.to_csv(csv_path, index=False)
-        _plot_histogram(table, hist_path, args.bins)
+        _plot_histogram(table, hist_path, args.bins, args.hist_y_scale, args.hist_min_area)
         label_guide_path = figure_dir / f"{path.stem}_mask_labels.png"
-        _save_label_guide(masks, label_guide_path)
+        _save_label_guide(
+            masks,
+            label_guide_path,
+            args.label_color_mode,
+            args.label_area_threshold,
+            args.label_color_above,
+            args.label_color_below,
+        )
 
         rows.append(
             {
@@ -97,6 +130,8 @@ def main() -> int:
                 "prepared_shape": "x".join(str(value) for value in prepared.shape),
                 "seg_channel": args.seg_channel,
                 "do_3d": do_3d,
+                "pretrained_model": args.pretrained_model,
+                "model_type": args.model_type,
                 "labels": int(masks.max()) if masks.size else 0,
                 "mask_tif": str(mask_path),
                 "area_csv": str(csv_path),
@@ -189,18 +224,29 @@ def _resolve_device(requested: str) -> torch.device:
     if requested == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
         return torch.device("cpu")
     if requested == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested, but torch.cuda.is_available() is False.")
+    if requested == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("MPS was requested, but torch.backends.mps.is_available() is False.")
     return torch.device(requested)
 
 
-def _save_label_guide(labels, output_path: Path) -> None:
+def _save_label_guide(
+    labels,
+    output_path: Path,
+    color_mode: str = "label",
+    area_threshold: float | None = None,
+    color_above: str = "red",
+    color_below: str = "yellow",
+) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if labels.ndim == 2:
         display = labels
         text_items = [
-            (prop.label, prop.centroid[1], prop.centroid[0])
+            (prop.label, prop.centroid[1], prop.centroid[0], prop.area)
             for prop in regionprops(labels)
         ]
         title = "Mask labels"
@@ -211,11 +257,20 @@ def _save_label_guide(labels, output_path: Path) -> None:
         return
 
     fig, ax = plt.subplots(figsize=(10, 10))
-    masked = np.ma.masked_where(display == 0, display)
-    ax.imshow(masked, cmap="nipy_spectral", interpolation="nearest")
+    if color_mode == "area-threshold":
+        if area_threshold is None:
+            raise ValueError("--label-area-threshold is required when --label-color-mode area-threshold is used.")
+        ax.imshow(
+            _area_threshold_rgb(display, text_items, area_threshold, color_above, color_below),
+            interpolation="nearest",
+        )
+        title = f"{title}, area >= {area_threshold:g}: {color_above}, area < {area_threshold:g}: {color_below}"
+    else:
+        masked = np.ma.masked_where(display == 0, display)
+        ax.imshow(masked, cmap="nipy_spectral", interpolation="nearest")
     ax.set_title(title)
     ax.set_axis_off()
-    for label, x_pos, y_pos in text_items:
+    for label, x_pos, y_pos, area in text_items:
         ax.text(
             x_pos,
             y_pos,
@@ -245,8 +300,19 @@ def _project_labels_with_centroids(labels):
         coords = np.argwhere(plane)
         if coords.size:
             y_pos, x_pos = coords.mean(axis=0)
-            text_items.append((int(label_id), float(x_pos), float(y_pos)))
+            text_items.append((int(label_id), float(x_pos), float(y_pos), float(area_by_z[z_index])))
     return display, text_items
+
+
+def _area_threshold_rgb(display, text_items, area_threshold: float, color_above: str, color_below: str):
+    rgb = np.ones((*display.shape, 3), dtype=float)
+    above = np.array(to_rgb(color_above), dtype=float)
+    below = np.array(to_rgb(color_below), dtype=float)
+    areas_by_label = {label: area for label, x_pos, y_pos, area in text_items}
+    for label, area in areas_by_label.items():
+        color = above if area >= area_threshold else below
+        rgb[display == label] = color
+    return rgb
 
 
 if __name__ == "__main__":
